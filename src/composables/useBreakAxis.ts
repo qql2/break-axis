@@ -1,16 +1,19 @@
 /**
  * 断轴功能 Composable
  * 提供 IQR 双向断轴算法和断轴后处理管道
+ * 采用纯管道模式 + 依赖注入设计
  */
 
 import type {
   BreakInterval,
-  BreakContext,
+  BreakMetadata,
   BreakProcessor,
   BreakAxisConfig,
   BreakAxisResult,
   IQRBreakAxisResult,
-} from '@/types/breakAxis'
+  BreakComputeFunctions,
+  BreakDebug,
+} from '../types/breakAxis'
 
 /**
  * 计算 IQR 断轴区间
@@ -112,47 +115,61 @@ function combineRawBreaks(rawUpper: BreakInterval[], rawLower: BreakInterval[]):
 }
 
 /**
- * 计算中心可见区间
+ * 创建计算函数工厂（依赖注入）
  */
-function calculateCenterVisible(breaks: BreakInterval[]): [number, number] {
-  if (!breaks || breaks.length === 0) {
-    return [-Infinity, Infinity]
-  }
-
-  let minStartAboveZero = Infinity
-  let maxEndBelowZero = -Infinity
-
-  for (const b of breaks) {
-    if (b.start >= 0 && b.start < minStartAboveZero) {
-      minStartAboveZero = b.start
+function createComputeFunctions(): BreakComputeFunctions {
+  /**
+   * 计算中心可见区间
+   */
+  const calculateCenterVisible = (breaks: BreakInterval[]): [number, number] => {
+    if (!breaks || breaks.length === 0) {
+      return [-Infinity, Infinity]
     }
-    if (b.end <= 0 && b.end > maxEndBelowZero) {
-      maxEndBelowZero = b.end
+
+    let minStartAboveZero = Infinity
+    let maxEndBelowZero = -Infinity
+
+    for (const b of breaks) {
+      if (b.start >= 0 && b.start < minStartAboveZero) {
+        minStartAboveZero = b.start
+      }
+      if (b.end <= 0 && b.end > maxEndBelowZero) {
+        maxEndBelowZero = b.end
+      }
     }
+
+    return [maxEndBelowZero, minStartAboveZero]
   }
 
-  return [maxEndBelowZero, minStartAboveZero]
-}
-
-/**
- * 计算正常值边界
- */
-function calculateNormalBoundary(values: number[], centerVisible: [number, number]) {
-  const normalValues = values.filter((v) => v >= centerVisible[0] && v <= centerVisible[1])
-  if (normalValues.length === 0) {
-    return { normalMin: centerVisible[0], normalMax: centerVisible[1] }
+  /**
+   * 计算正常值边界（依赖 calculateCenterVisible）
+   */
+  const calculateNormalBoundary = (
+    values: number[],
+    centerVisible: [number, number],
+  ): { normalMin: number; normalMax: number } => {
+    const normalValues = values.filter((v) => v >= centerVisible[0] && v <= centerVisible[1])
+    if (normalValues.length === 0) {
+      return { normalMin: centerVisible[0], normalMax: centerVisible[1] }
+    }
+    const normalMin = Math.min(...normalValues)
+    const normalMax = Math.max(...normalValues)
+    return { normalMin, normalMax }
   }
-  const normalMin = Math.min(...normalValues)
-  const normalMax = Math.max(...normalValues)
-  return { normalMin, normalMax }
-}
 
-/**
- * 计算可见范围
- */
-function computeVisibleRange(ctx: BreakContext): number {
-  const totalBreakWidth = ctx.breaks.reduce((sum, b) => sum + Math.abs(b.end - b.start), 0)
-  return Math.max(0, ctx.totalRange - totalBreakWidth)
+  /**
+   * 计算可见范围
+   */
+  const computeVisibleRange = (breaks: BreakInterval[], totalRange: number): number => {
+    const totalBreakWidth = breaks.reduce((sum, b) => sum + Math.abs(b.end - b.start), 0)
+    return Math.max(0, totalRange - totalBreakWidth)
+  }
+
+  return {
+    calculateCenterVisible,
+    calculateNormalBoundary,
+    computeVisibleRange,
+  }
 }
 
 /**
@@ -163,23 +180,30 @@ function breaksSignature(breaks: BreakInterval[]): string {
 }
 
 /**
- * 创建缓冲调整处理器
+ * 创建缓冲调整处理器（依赖注入计算函数）
  */
-function createBufferAdjustProcessor(bufferRatio: number = 0.2): BreakProcessor {
-  return (ctx) => {
-    if (ctx.breaks.length === 0) return ctx
+function createBufferAdjustProcessor(
+  computeFunctions: BreakComputeFunctions,
+  bufferRatio: number = 0.2,
+): BreakProcessor {
+  return (breaks: BreakInterval[], metadata: BreakMetadata) => {
+    if (breaks.length === 0) return breaks
 
-    const normalMin = ctx.debug.normalMin
-    const normalMax = ctx.debug.normalMax
+    // 使用注入的计算函数
+    const centerVisible = computeFunctions.calculateCenterVisible(breaks)
+    const { normalMin, normalMax } = computeFunctions.calculateNormalBoundary(
+      metadata.numericValues,
+      centerVisible,
+    )
+
     const normalRange = normalMax - normalMin
-
-    if (normalRange <= 0) return ctx
+    if (normalRange <= 0) return breaks
 
     const buffer = normalRange * bufferRatio
 
-    const adjusted = ctx.breaks.map((b) => {
-      const isUpperBreak = b.start >= ctx.debug.b_upper
-      const isLowerBreak = b.end <= ctx.debug.b_lower
+    const adjusted = breaks.map((b) => {
+      const isUpperBreak = b.start >= metadata.iqrBounds.b_upper
+      const isLowerBreak = b.end <= metadata.iqrBounds.b_lower
 
       if (isUpperBreak) {
         const targetStart = normalMax + buffer
@@ -196,15 +220,15 @@ function createBufferAdjustProcessor(bufferRatio: number = 0.2): BreakProcessor 
       return b
     })
 
-    return { ...ctx, breaks: adjusted }
+    return adjusted
   }
 }
 
 /**
- * 四舍五入到整数边界并移除非法区间
+ * 四舍五入到整数边界并移除非法区间（纯函数，无依赖）
  */
-const roundAndValidate: BreakProcessor = (ctx) => {
-  const rounded = ctx.breaks.map((b) => {
+const roundAndValidate: BreakProcessor = (breaks: BreakInterval[]) => {
+  return breaks.map((b) => {
     if (b.start < b.end) {
       return { start: Math.ceil(b.start), end: Math.ceil(b.end) }
     } else if (b.start > b.end) {
@@ -212,51 +236,84 @@ const roundAndValidate: BreakProcessor = (ctx) => {
     }
     return { start: b.start, end: b.end }
   })
-  return { ...ctx, breaks: rounded }
 }
 
 /**
- * 创建最小宽度过滤处理器
+ * 创建最小宽度过滤处理器（依赖注入计算函数）
  */
-function createMinWidthFilterProcessor(minWidthRatio: number = 0.1): BreakProcessor {
-  return (ctx) => {
-    if (!ctx.visibleRange) return ctx
-    const threshold = ctx.visibleRange * minWidthRatio
-    const filtered = ctx.breaks.filter((b) => Math.abs(b.end - b.start) >= threshold)
-    return { ...ctx, breaks: filtered }
+function createMinWidthFilterProcessor(
+  computeFunctions: BreakComputeFunctions,
+  minWidthRatio: number = 0.1,
+): BreakProcessor {
+  return (breaks: BreakInterval[], metadata: BreakMetadata) => {
+    // 使用注入的计算函数
+    const visibleRange = computeFunctions.computeVisibleRange(breaks, metadata.totalRange)
+    const threshold = visibleRange * minWidthRatio
+    return breaks.filter((b) => Math.abs(b.end - b.start) >= threshold)
   }
 }
 
 /**
- * 断轴后处理管道（带反馈循环，直到收敛）
+ * 纯管道处理（无反馈循环）
+ */
+function processBreaksPipeline(
+  breaks: BreakInterval[],
+  metadata: BreakMetadata,
+  processors: BreakProcessor[],
+): BreakInterval[] {
+  let result = breaks
+  for (const processor of processors) {
+    result = processor(result, metadata)
+  }
+  return result
+}
+
+/**
+ * 带反馈循环的断轴处理
  */
 function processBreaksWithFeedback(
-  initial: BreakContext,
+  initialBreaks: BreakInterval[],
+  metadata: BreakMetadata,
   processors: BreakProcessor[],
+  computeFunctions: BreakComputeFunctions,
   maxIters: number = 5,
-): BreakContext {
+): BreakInterval[] {
   let lastSig = ''
-  let ctx = initial
+  let breaks = initialBreaks
 
   for (let i = 0; i < maxIters; i++) {
-    const centerVisible = calculateCenterVisible(ctx.breaks)
-    const visibleRange = computeVisibleRange(ctx)
-    ctx = { ...ctx, visibleRange, centerVisible }
+    // 执行管道处理
+    breaks = processBreaksPipeline(breaks, metadata, processors)
 
-    const { normalMin, normalMax } = calculateNormalBoundary(ctx.numericValues, ctx.centerVisible)
-    ctx = { ...ctx, debug: { ...ctx.debug, normalMin, normalMax } }
-
-    // 应用所有处理器
-    for (const processor of processors) {
-      ctx = processor(ctx)
-    }
-
-    const sig = breaksSignature(ctx.breaks)
+    // 检测收敛
+    const sig = breaksSignature(breaks)
     if (sig === lastSig) break
     lastSig = sig
   }
 
-  return ctx
+  return breaks
+}
+
+/**
+ * 计算最终调试信息（在管道外部）
+ */
+function computeFinalDebug(
+  breaks: BreakInterval[],
+  metadata: BreakMetadata,
+  iqrDebug: IQRBreakAxisResult['debug'],
+  computeFunctions: BreakComputeFunctions,
+): BreakDebug {
+  const centerVisible = computeFunctions.calculateCenterVisible(breaks)
+  const { normalMin, normalMax } = computeFunctions.calculateNormalBoundary(
+    metadata.numericValues,
+    centerVisible,
+  )
+
+  return {
+    ...iqrDebug,
+    normalMin,
+    normalMax,
+  }
 }
 
 /**
@@ -284,49 +341,49 @@ export function calculateBreakAxis(
   if (totalRange <= 0) return null
 
   // 计算 IQR 断轴
-  const { breaksUpper, breaksLower, debug } = calculateIQRBreakAxis(
+  const {
+    breaksUpper,
+    breaksLower,
+    debug: iqrDebug,
+  } = calculateIQRBreakAxis(numericValues, config.k ?? 1.5, config.ignoreZero ?? true)
+
+  const initialBreaks = combineRawBreaks(breaksUpper, breaksLower)
+  if (initialBreaks.length === 0) return null
+
+  // 创建元数据（只包含原始数据）
+  const metadata: BreakMetadata = {
     numericValues,
-    config.k ?? 1.5,
-    config.ignoreZero ?? true,
-  )
-
-  const breaks = combineRawBreaks(breaksUpper, breaksLower)
-  if (breaks.length === 0) return null
-
-  const centerVisible = calculateCenterVisible(breaks)
-  const { normalMin, normalMax } = calculateNormalBoundary(numericValues, centerVisible)
-
-  // 构建初始上下文
-  const initialCtx: BreakContext = {
-    numericValues,
-    centerVisible,
-    rawUpper: breaksUpper,
-    rawLower: breaksLower,
-    breaks,
-    debug: {
-      ...debug,
-      normalMin,
-      normalMax,
-    },
     totalRange,
-    minVal,
-    maxVal,
-    k: config.k ?? 1.5,
+    iqrBounds: {
+      b_upper: iqrDebug.b_upper,
+      b_lower: iqrDebug.b_lower,
+    },
   }
 
-  // 构建处理器管道
+  // 创建计算函数（依赖注入）
+  const computeFunctions = createComputeFunctions()
+
+  // 构建处理器管道（注入计算函数）
   const processors: BreakProcessor[] = [
-    createBufferAdjustProcessor(config.bufferRatio ?? 0.2),
+    createBufferAdjustProcessor(computeFunctions, config.bufferRatio ?? 0.2),
     roundAndValidate,
-    createMinWidthFilterProcessor(config.minWidthRatio ?? 0.1),
+    createMinWidthFilterProcessor(computeFunctions, config.minWidthRatio ?? 0.1),
   ]
 
-  // 执行处理管道
-  const processed = processBreaksWithFeedback(initialCtx, processors)
+  // 执行带反馈循环的处理
+  const finalBreaks = processBreaksWithFeedback(
+    initialBreaks,
+    metadata,
+    processors,
+    computeFunctions,
+  )
+
+  // 计算最终调试信息（在管道外部）
+  const finalDebug = computeFinalDebug(finalBreaks, metadata, iqrDebug, computeFunctions)
 
   return {
-    breaks: processed.breaks,
-    debug: processed.debug,
+    breaks: finalBreaks,
+    debug: finalDebug,
   }
 }
 
@@ -340,4 +397,3 @@ export function useBreakAxis() {
     calculateIQRBreakAxis,
   }
 }
-

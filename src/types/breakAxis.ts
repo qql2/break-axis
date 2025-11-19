@@ -36,23 +36,31 @@ export type BreakDebug = {
   normalMax: number // 正常值实际最大值
 }
 
-/** 断轴处理上下文 */
-export type BreakContext = {
-  centerVisible: [number, number]
+/** 断轴元数据（只包含原始数据，不包含计算出的中间数据） */
+export type BreakMetadata = {
   numericValues: number[]
-  rawUpper: BreakInterval[]
-  rawLower: BreakInterval[]
-  breaks: BreakInterval[]
-  debug: BreakDebug
   totalRange: number
-  minVal: number
-  maxVal: number
-  k: number
-  visibleRange?: number
+  iqrBounds: {
+    b_upper: number
+    b_lower: number
+  }
 }
 
-/** 断轴处理器函数类型 */
-export type BreakProcessor = (ctx: BreakContext) => BreakContext
+/** 断轴处理器函数类型（纯管道模式） */
+export type BreakProcessor = (breaks: BreakInterval[], metadata: BreakMetadata) => BreakInterval[]
+
+/** 计算函数接口（用于依赖注入） */
+export type BreakComputeFunctions = {
+  /** 计算中心可见区间 */
+  calculateCenterVisible: (breaks: BreakInterval[]) => [number, number]
+  /** 计算正常值边界 */
+  calculateNormalBoundary: (
+    values: number[],
+    centerVisible: [number, number],
+  ) => { normalMin: number; normalMax: number }
+  /** 计算可见范围 */
+  computeVisibleRange: (breaks: BreakInterval[], totalRange: number) => number
+}
 
 /** 断轴配置 */
 export type BreakAxisConfig = {
