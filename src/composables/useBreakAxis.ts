@@ -229,12 +229,11 @@ function createBufferAdjustProcessor(
  */
 const roundAndValidate: BreakProcessor = (breaks: BreakInterval[]) => {
   return breaks.map((b) => {
-    if (b.start < b.end) {
+    if (Math.abs(b.start) < Math.abs(b.end)) {
       return { start: Math.ceil(b.start), end: Math.ceil(b.end) }
-    } else if (b.start > b.end) {
+    } else {
       return { start: Math.floor(b.start), end: Math.floor(b.end) }
     }
-    return { start: b.start, end: b.end }
   })
 }
 
